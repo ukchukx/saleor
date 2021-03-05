@@ -4984,7 +4984,8 @@ type ShippingZone implements Node & ObjectWithMetadata {
   priceRange: MoneyRange
   countries: [CountryDisplay]
   shippingMethods: [ShippingMethod]
-  warehouses: [Warehouse]
+  warehouses: [Warehouse!]!
+  channels: [Channel!]!
   description: String
 }
 
