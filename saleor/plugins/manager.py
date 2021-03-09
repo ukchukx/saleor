@@ -4,16 +4,20 @@ from typing import TYPE_CHECKING, Any, Dict, Iterable, List, Optional, Tuple, Un
 import opentracing
 from django.conf import settings
 from django.core.handlers.wsgi import WSGIRequest
+from django.db.models import Q
 from django.http import HttpResponse, HttpResponseNotFound
 from django.utils.module_loading import import_string
 from django_countries.fields import Country
 from prices import Money, TaxedMoney
 
+from ..app.models import App
 from ..checkout import base_calculations
 from ..core.payments import PaymentInterface
 from ..core.prices import quantize_price
 from ..core.taxes import TaxType, zero_taxed_money
 from ..discount import DiscountInfo
+from ..payment.interface import PaymentGateway
+from ..webhook.event_types import WebhookEventType
 from .base_plugin import ExternalAccessTokens
 from .models import PluginConfiguration
 
@@ -31,7 +35,6 @@ if TYPE_CHECKING:
         GatewayResponse,
         InitializedPaymentResponse,
         PaymentData,
-        PaymentGateway,
         TokenConfig,
     )
     from ..product.models import (
@@ -42,6 +45,19 @@ if TYPE_CHECKING:
         ProductVariantChannelListing,
     )
     from .base_plugin import BasePlugin
+
+
+def to_payment_app_id(app: "App") -> "str":
+    return f"app:{app.pk}"
+
+
+def from_payment_app_id(app_id: str) -> "int":
+    return int(app_id.split(":")[1])
+
+
+def app_to_payment_gateway(app: "App") -> "PaymentGateway":
+    app_id = to_payment_app_id(app)
+    return PaymentGateway(id=app_id, name=app.name, config=[], currencies=[])
 
 
 class PluginsManager(PaymentInterface):
@@ -585,16 +601,34 @@ class PluginsManager(PaymentInterface):
             if payment_method in type(plugin).__dict__
         }
 
+    def list_payment_apps(self, active_only: bool = False) -> Dict[str, "App"]:
+        # TODO: active_only default False?
+        # TODO: move below DB-fetching logic to a queryset method
+        query = Q(webhooks__events__event_type__in=[WebhookEventType.PAYMENT_PROCESS])
+        if active_only:
+            query &= Q(is_active=True)
+        payment_apps = App.objects.filter(query)
+        # TODO: add filtering to return apps with active webhooks
+        return {to_payment_app_id(app): app for app in payment_apps}
+
     def list_payment_gateways(
         self, currency: Optional[str] = None, active_only: bool = True
     ) -> List["PaymentGateway"]:
-        payment_plugins = self.list_payment_plugin(active_only=active_only)
-        # if currency is given return only gateways which support given currency
         gateways = []
+
+        # append payment plugins
+        payment_plugins = self.list_payment_plugin(active_only=active_only)
         for plugin in payment_plugins.values():
+            # if currency is given return only gateways which support given currency
             gateway = plugin.get_payment_gateway(currency=currency, previous_value=None)
             if gateway:
                 gateways.append(gateway)
+
+        # append payment apps
+        payment_apps = self.list_payment_apps(active_only=active_only)
+        for app in payment_apps.values():
+            gateways.append(app_to_payment_gateway(app))
+
         return gateways
 
     def list_external_authentications(self, active_only: bool = True) -> List[dict]:
@@ -612,14 +646,24 @@ class PluginsManager(PaymentInterface):
         self,
         checkout: "Checkout",
     ) -> List["PaymentGateway"]:
-        payment_plugins = self.list_payment_plugin(active_only=True)
         gateways = []
+
+        # append payment plugins
+        payment_plugins = self.list_payment_plugin(active_only=True)
         for plugin in payment_plugins.values():
             gateway = plugin.get_payment_gateway_for_checkout(
                 checkout, previous_value=None
             )
             if gateway:
                 gateways.append(gateway)
+
+        # append payment apps
+        payment_apps = self.list_payment_apps(active_only=True)
+        for app_id, app in payment_apps.items():
+            gateways.append(
+                PaymentGateway(id=app_id, name=app.name, config=[], currencies=[])
+            )
+
         return gateways
 
     def __run_payment_method(
@@ -630,7 +674,7 @@ class PluginsManager(PaymentInterface):
         **kwargs,
     ) -> "GatewayResponse":
         default_value = None
-        gtw = self.get_plugin(gateway)
+        gtw = self.get_payment_gateway(gateway)
         if gtw is not None:
             resp = self.__run_method_on_single_plugin(
                 gtw,
@@ -700,6 +744,17 @@ class PluginsManager(PaymentInterface):
             if plugin.PLUGIN_ID == plugin_id:
                 return plugin
         return None
+
+    def get_payment_gateway(self, gateway_id: str) -> Any:
+        gateway = None
+        gateway = self.get_plugin(gateway_id)
+        if not gateway:
+            # try to get payment app
+            app_pk = from_payment_app_id(gateway_id)
+            app = App.objects.filter(pk=app_pk).first()
+            if app:
+                gateway = self.get_plugin("mirumee.webhooks")
+        return gateway
 
     def fetch_taxes_data(self) -> bool:
         default_value = False

@@ -1,5 +1,9 @@
 from typing import TYPE_CHECKING, Any, List, Optional
 
+from saleor.plugins.manager import from_payment_app_id
+
+from ...payment import TransactionKind
+from ...payment.interface import GatewayResponse, PaymentMethodInfo
 from ...webhook.event_types import WebhookEventType
 from ...webhook.payloads import (
     generate_checkout_payload,
@@ -8,19 +12,23 @@ from ...webhook.payloads import (
     generate_invoice_payload,
     generate_order_payload,
     generate_page_payload,
+    generate_payment_payload,
     generate_product_deleted_payload,
     generate_product_payload,
     generate_product_variant_payload,
 )
 from ..base_plugin import BasePlugin
-from .tasks import trigger_webhooks_for_event
+from .tasks import trigger_webhook_sync, trigger_webhooks_for_event
 
 if TYPE_CHECKING:
+    from requests.models import Response as RequestsResponse
+
     from ...account.models import User
     from ...checkout.models import Checkout
     from ...invoice.models import Invoice
     from ...order.models import Fulfillment, Order
     from ...page.models import Page
+    from ...payment.interface import PaymentData
     from ...product.models import Product, ProductVariant
 
 
@@ -202,3 +210,64 @@ class WebhookPlugin(BasePlugin):
             return previous_value
         page_data = generate_page_payload(page)
         trigger_webhooks_for_event.delay(WebhookEventType.PAGE_DELETED, page_data)
+
+    def process_payment(
+        self, payment_information: "PaymentData", previous_value
+    ) -> "GatewayResponse":
+        if not self.active:
+            return previous_value
+
+        # TODO: get App here somehow
+        # HACK start
+        from ...app.models import App
+        from ...payment.models import Payment
+
+        payment = Payment.objects.get(pk=payment_information.payment_id)
+        app_id = from_payment_app_id(payment.gateway)
+        app = App.objects.get(pk=app_id)
+        webhook = app.webhooks.filter(
+            is_active=True, events__event_type=WebhookEventType.PAYMENT_PROCESS
+        )[0]
+        print(webhook.__dict__)
+        # HACK end
+
+        webhook_payload = generate_payment_payload(payment_information)
+        response = trigger_webhook_sync(
+            webhook, WebhookEventType.PAYMENT_PROCESS, webhook_payload
+        )
+
+        def webhook_response_to_gateway_response(
+            response: "RequestsResponse",
+        ) -> "GatewayResponse":
+            response_json = response.json()
+
+            error = response_json.get("error")
+            is_success = response.status_code == 200 and not error
+
+            payment_method_info = PaymentMethodInfo(
+                brand=response_json.get("payment_method_brand"),
+                exp_month=response_json.get("payment_method_exp_month"),
+                exp_year=response_json.get("payment_method_exp_year"),
+                last_4=response_json.get("payment_method_last_4"),
+                name=response_json.get("payment_method_name"),
+                type=response_json.get("payment_method_type"),
+            )
+
+            return GatewayResponse(
+                action_required=response_json.get("action_required", False),
+                action_required_data=response_json.get("action_required_data"),
+                amount=payment_information.amount,
+                currency=payment_information.currency,
+                customer_id=response_json.get("customer_id"),
+                error=error,
+                is_success=is_success,
+                kind=TransactionKind.CAPTURE,
+                transaction_id=response_json.get("transaction_id"),
+                payment_method_info=payment_method_info,
+                raw_response=response_json,
+            )
+
+        gateway_response = webhook_response_to_gateway_response(response)
+        print("RESPONSE: ", gateway_response)
+        # FIXME: check if this gets saved to the database
+        return gateway_response

@@ -17,6 +17,9 @@ class Webhook(models.Model):
     is_active = models.BooleanField(default=True)
     secret_key = models.CharField(max_length=255, null=True, blank=True)
 
+    def __str__(self):
+        return self.name
+
 
 class WebhookEvent(models.Model):
     webhook = models.ForeignKey(
