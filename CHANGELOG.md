@@ -91,6 +91,7 @@ All notable, unreleased changes to this project will be documented in this file.
 - Add default sorting by rank for search products - #6936 by @d-wysocki
 - Fix exporting product description to xlsx - #6959 by @IKarbowiak
 - Add `Shop.version` field to query API version - #6980 by @maarcingebala
+- Add new authorization header `Authorization-Bearer` - #6998 by @korycins
 
 # 2.11.1
 
